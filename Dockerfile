@@ -16,4 +16,9 @@ RUN pip install -r requirements.txt
 COPY . .
 
 # Run server
+
+COPY wait-for-db.sh /wait-for-db.sh
+RUN chmod +x /wait-for-db.sh
+RUN apt-get update && apt-get install -y netcat-openbsd
+
 CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
