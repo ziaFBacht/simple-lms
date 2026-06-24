@@ -37,6 +37,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'ninja',
     'lms'
 ]
 
@@ -94,6 +95,14 @@ DATABASES = {
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
 
 AUTH_USER_MODEL = 'lms.User'
+
+# ======================
+# JWT Settings (custom, lihat lms/auth.py)
+# ======================
+JWT_SECRET_KEY = SECRET_KEY
+JWT_ALGORITHM = 'HS256'
+JWT_ACCESS_TOKEN_LIFETIME_MINUTES = 30
+JWT_REFRESH_TOKEN_LIFETIME_DAYS = 7
 
 AUTH_PASSWORD_VALIDATORS = [
     {
