@@ -1,31 +1,137 @@
 services:
+
+  # ==================== PostgreSQL ====================
   db:
     image: postgres:15
     container_name: lms_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    env_file:
-      - .env
+    env_file: .env
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
+  # ==================== Redis ====================
+  redis:
+    image: redis:7-alpine
+    container_name: lms_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ==================== MongoDB ====================
+  mongodb:
+    image: mongo:7
+    container_name: lms_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== RabbitMQ (message broker) ====================
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: lms_rabbitmq
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI  ->  http://localhost:15672
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Django Web ====================
   web:
     build: .
     container_name: lms_web
     command: >
-      sh -c "echo 'Waiting for database...' &&
+      sh -c "echo 'Waiting for postgres...' &&
              while ! nc -z db 5432; do sleep 1; done &&
-             echo 'Database ready!' &&
+             echo 'Waiting for redis...' &&
+             while ! nc -z redis 6379; do sleep 1; done &&
              python manage.py migrate &&
              python manage.py runserver 0.0.0.0:8000"
     volumes:
       - .:/app
+      - media_data:/app/media
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    env_file: .env
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+  # ==================== Celery Worker ====================
+  celery-worker:
+    build: .
+    container_name: lms_celery_worker
+    command: celery -A config worker --loglevel=info --concurrency=4
+    volumes:
+      - .:/app
+      - media_data:/app/media
+    env_file: .env
+    depends_on:
+      - web
+      - redis
+      - rabbitmq
+      - mongodb
+
+  # ==================== Celery Beat (scheduler) ====================
+  celery-beat:
+    build: .
+    container_name: lms_celery_beat
+    command: celery -A config beat --loglevel=info
+    volumes:
+      - .:/app
+    env_file: .env
+    depends_on:
+      - web
+      - redis
+      - rabbitmq
+
+  # ==================== Flower (Celery monitoring) ====================
+  flower:
+    build: .
+    container_name: lms_flower
+    command: celery -A config flower --port=5555
+    ports:
+      - "5555:5555"   # Flower UI  ->  http://localhost:5555
+    env_file: .env
+    depends_on:
+      - rabbitmq
+      - redis
 
 volumes:
   postgres_data:
+  redis_data:
+  mongo_data:
+  rabbitmq_data:
+  media_data:

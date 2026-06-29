@@ -1,5 +1,6 @@
 """
-Simple LMS REST API (Django Ninja).
+Simple LMS REST API (Django Ninja) — Updated with Redis cache, MongoDB logging,
+Celery tasks, Rate Limiting, dan Report endpoint.
 """
 import math
 from typing import List
@@ -10,17 +11,41 @@ from ninja import NinjaAPI, Router
 from ninja.errors import HttpError
 
 from lms.auth import create_access_token, decode_token, generate_tokens, jwt_auth
+from lms.cache import (
+    get_cached_course_detail,
+    get_cached_course_list,
+    invalidate_course_cache,
+    rate_limit,
+    set_cached_course_detail,
+    set_cached_course_list,
+)
 from lms.helpers import get_object_or_404
-from lms.models import Course, Enrollment, Lesson, Progress, User
+from lms.models import Category, Course, Enrollment, Lesson, Progress, User
 from lms.permissions import check_course_owner, is_admin, is_instructor, is_student
 from lms.schemas import (
-    CourseDetailOut, CourseIn, CourseOut, CourseUpdateIn,
-    EnrollmentIn, EnrollmentOut, LoginIn, MyCourseOut, PaginatedCoursesOut,
-    ProgressIn, ProgressOut, RefreshIn, RefreshOut, RegisterIn, TokenOut,
-    UserOut, UserUpdateIn,
+    CourseDetailOut,
+    CourseIn,
+    CourseOut,
+    CourseUpdateIn,
+    EnrollmentIn,
+    EnrollmentOut,
+    LoginIn,
+    MyCourseOut,
+    PaginatedCoursesOut,
+    ProgressIn,
+    ProgressOut,
+    RefreshIn,
+    RefreshOut,
+    RegisterIn,
+    TokenOut,
+    UserOut,
+    UserUpdateIn,
 )
-from lms.models import Category, Course, Enrollment, Lesson, Progress, User  # tambah Category
 
+
+# ============================================================
+# AUTH ROUTER  ->  /api/auth/...
+# ============================================================
 auth_router = Router(tags=["Authentication"])
 
 
@@ -29,14 +54,11 @@ def register(request, data: RegisterIn):
     """Registrasi user baru. Role hanya boleh 'student' atau 'instructor'."""
     if data.role not in ("student", "instructor"):
         raise HttpError(400, "Role hanya boleh 'student' atau 'instructor'")
-
     if User.objects.filter(username=data.username).exists():
         raise HttpError(400, "Username sudah digunakan")
-
     if User.objects.filter(email=data.email).exists():
         raise HttpError(400, "Email sudah digunakan")
 
-    # create_user() otomatis melakukan hashing password (PBKDF2 + SHA256)
     user = User.objects.create_user(
         username=data.username,
         email=data.email,
@@ -45,6 +67,20 @@ def register(request, data: RegisterIn):
         last_name=data.last_name,
         role=data.role,
     )
+
+    # Log activity ke MongoDB (fire-and-forget, tidak blocking)
+    try:
+        from lms.mongo import log_activity
+        log_activity(
+            user_id=user.id,
+            username=user.username,
+            action="register",
+            detail={"role": user.role},
+            ip=request.META.get("REMOTE_ADDR", ""),
+        )
+    except Exception:
+        pass
+
     return 201, user
 
 
@@ -54,6 +90,18 @@ def login(request, data: LoginIn):
     user = authenticate(request, username=data.username, password=data.password)
     if user is None:
         raise HttpError(401, "Username atau password salah")
+
+    try:
+        from lms.mongo import log_activity
+        log_activity(
+            user_id=user.id,
+            username=user.username,
+            action="login",
+            ip=request.META.get("REMOTE_ADDR", ""),
+        )
+    except Exception:
+        pass
+
     return generate_tokens(user)
 
 
@@ -61,10 +109,8 @@ def login(request, data: LoginIn):
 def refresh_token(request, data: RefreshIn):
     """Tukar refresh token yang masih valid dengan access token baru."""
     payload = decode_token(data.refresh)
-
     if payload.get("token_type") != "refresh":
         raise HttpError(401, "Token ini bukan refresh token yang valid")
-
     user = get_object_or_404(User, pk=payload["user_id"])
     return {"access": create_access_token(user), "token_type": "bearer"}
 
@@ -79,24 +125,26 @@ def get_me(request):
 def update_me(request, data: UserUpdateIn):
     """Update profile user yang sedang login (field opsional)."""
     user = request.auth
-
     if data.email is not None and data.email != user.email:
         if User.objects.filter(email=data.email).exclude(pk=user.pk).exists():
             raise HttpError(400, "Email sudah digunakan oleh user lain")
         user.email = data.email
-
     if data.first_name is not None:
         user.first_name = data.first_name
     if data.last_name is not None:
         user.last_name = data.last_name
-
     user.save()
     return user
 
+
+# ============================================================
+# COURSES ROUTER  ->  /api/courses/...
+# ============================================================
 courses_router = Router(tags=["Courses"])
 
 
 @courses_router.get("", response=PaginatedCoursesOut)
+@rate_limit
 def list_courses(
     request,
     search: str = None,
@@ -106,17 +154,24 @@ def list_courses(
     page_size: int = 10,
 ):
     """
-    List semua course (PUBLIC) dengan pagination & filter opsional.
+    List semua course (PUBLIC) dengan pagination, filter, dan Redis caching.
 
-    Query params:
-    - search: cari berdasarkan judul course
-    - category_id / instructor_id: filter
-    - page, page_size: pagination
+    Flow:
+    1. Cek Redis cache → kalau HIT, kembalikan dari cache (tidak query DB)
+    2. Kalau MISS → query PostgreSQL → simpan ke Redis → kembalikan
+
+    Rate limit: 60 request/menit per IP.
     """
-    page = max(page, 1)
+    page      = max(page, 1)
     page_size = max(min(page_size, 100), 1)
 
-    qs = Course.objects.for_listing()  # select_related('instructor', 'category')
+    # --- Cache lookup ---
+    cached = get_cached_course_list(page, page_size, search, category_id, instructor_id)
+    if cached:
+        return cached
+
+    # --- Cache miss: query DB ---
+    qs = Course.objects.for_listing()
     if search:
         qs = qs.filter(title__icontains=search)
     if category_id:
@@ -127,17 +182,34 @@ def list_courses(
     total = qs.count()
     pages = max(math.ceil(total / page_size), 1)
     start = (page - 1) * page_size
-    items = list(qs.order_by("id")[start : start + page_size])
+    items = list(qs.order_by("id")[start: start + page_size])
 
-    return {
-        "items": items, "total": total,
-        "page": page, "page_size": page_size, "pages": pages,
+    # Serialize dulu ke dict pakai schema (supaya bisa disimpan ke Redis)
+    items_data = [CourseOut.from_orm(c).dict() for c in items]
+    result = {
+        "items": items_data,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
     }
+
+    set_cached_course_list(result, page, page_size, search, category_id, instructor_id)
+    return result
 
 
 @courses_router.get("/{course_id}", response=CourseDetailOut)
+@rate_limit
 def get_course(request, course_id: int):
-    """Detail course (PUBLIC) beserta daftar lesson di dalamnya."""
+    """
+    Detail course (PUBLIC) beserta daftar lesson.
+
+    Flow: Redis cache → DB jika miss → simpan ke Redis.
+    """
+    cached = get_cached_course_detail(course_id)
+    if cached:
+        return cached
+
     course = (
         Course.objects.select_related("instructor", "category")
         .prefetch_related("lessons")
@@ -146,13 +218,19 @@ def get_course(request, course_id: int):
     )
     if course is None:
         raise HttpError(404, "Course tidak ditemukan")
-    return course
+
+    data = CourseDetailOut.from_orm(course).dict()
+    set_cached_course_detail(data, course_id)
+    return data
 
 
 @courses_router.post("", response={201: CourseOut}, auth=jwt_auth)
 @is_instructor
 def create_course(request, data: CourseIn):
-    """Buat course baru. Hanya untuk user dengan role='instructor'."""
+    """
+    Buat course baru (instructor only).
+    Setelah create: invalidate course list cache supaya list selalu fresh.
+    """
     if data.category_id is not None:
         if not Category.objects.filter(pk=data.category_id).exists():
             raise HttpError(400, f"Category dengan id={data.category_id} tidak ditemukan")
@@ -163,12 +241,29 @@ def create_course(request, data: CourseIn):
         instructor=request.auth,
         category_id=data.category_id,
     )
+
+    # Invalidate cache
+    invalidate_course_cache(course.id)
+
+    # Log MongoDB
+    try:
+        from lms.mongo import log_activity
+        log_activity(
+            user_id=request.auth.id,
+            username=request.auth.username,
+            action="create_course",
+            detail={"course_id": course.id, "title": course.title},
+            ip=request.META.get("REMOTE_ADDR", ""),
+        )
+    except Exception:
+        pass
+
     return 201, course
 
 
 @courses_router.patch("/{course_id}", response=CourseOut, auth=jwt_auth)
 def update_course(request, course_id: int, data: CourseUpdateIn):
-    """Update sebagian data course. Hanya untuk instructor pemilik course."""
+    """Update sebagian data course (owner only). Invalidate cache setelah update."""
     course = get_object_or_404(Course, pk=course_id)
     check_course_owner(course, request.auth)
 
@@ -184,24 +279,33 @@ def update_course(request, course_id: int, data: CourseUpdateIn):
         course.category_id = data.category_id
 
     course.save()
+    invalidate_course_cache(course_id)
     return course
 
 
 @courses_router.delete("/{course_id}", response={204: None}, auth=jwt_auth)
 @is_admin
 def delete_course(request, course_id: int):
-    """Hapus course. Hanya untuk role='admin'."""
+    """Hapus course (admin only). Invalidate cache."""
     course = get_object_or_404(Course, pk=course_id)
     course.delete()
+    invalidate_course_cache(course_id)
     return 204, None
 
+
+# ============================================================
+# ENROLLMENTS ROUTER  ->  /api/enrollments/...
+# ============================================================
 enrollments_router = Router(tags=["Enrollments"])
 
 
 @enrollments_router.post("", response={201: EnrollmentOut}, auth=jwt_auth)
 @is_student
 def enroll_course(request, data: EnrollmentIn):
-    """Mendaftar (enroll) ke sebuah course. Hanya untuk role='student'."""
+    """
+    Mendaftar ke course (student only).
+    Setelah berhasil → trigger Celery task send_enrollment_email (async).
+    """
     course = get_object_or_404(Course, pk=data.course_id)
 
     try:
@@ -209,32 +313,54 @@ def enroll_course(request, data: EnrollmentIn):
     except IntegrityError:
         raise HttpError(409, "Anda sudah terdaftar di course ini")
 
+    # Trigger email async via Celery (tidak blocking response)
+    try:
+        from lms.tasks import send_enrollment_email
+        send_enrollment_email.delay(request.auth.id, course.id)
+    except Exception as e:
+        # Kalau Celery broker mati, endpoint tetap berhasil (email tidak kritis)
+        print(f"[CELERY WARNING] send_enrollment_email.delay failed: {e}")
+
+    # Log MongoDB
+    try:
+        from lms.mongo import log_activity
+        log_activity(
+            user_id=request.auth.id,
+            username=request.auth.username,
+            action="enroll",
+            detail={"course_id": course.id, "course_title": course.title},
+            ip=request.META.get("REMOTE_ADDR", ""),
+        )
+    except Exception:
+        pass
+
     return 201, enrollment
 
 
 @enrollments_router.get("/my-courses", response=List[MyCourseOut], auth=jwt_auth)
 def my_courses(request):
-    """Daftar course yang sudah diikuti oleh user yang sedang login, beserta progress."""
-    enrollments = Enrollment.objects.filter(
-        student=request.auth
-    ).for_student_dashboard().order_by("-enrolled_at")
+    """Daftar course yang sudah diikuti user yang sedang login, beserta progress."""
+    enrollments = (
+        Enrollment.objects.filter(student=request.auth)
+        .for_student_dashboard()
+        .order_by("-enrolled_at")
+    )
 
     result = []
     for enrollment in enrollments:
-        lessons_total = enrollment.course.lessons.count()
+        lessons_total     = enrollment.course.lessons.count()
         lessons_completed = Progress.objects.filter(
             student=request.auth, lesson__course=enrollment.course, completed=True
         ).count()
         percentage = (
             round((lessons_completed / lessons_total) * 100, 2) if lessons_total else 0.0
         )
-
         result.append({
-            "enrollment_id": enrollment.id,
-            "course": enrollment.course,
-            "enrolled_at": enrollment.enrolled_at,
-            "lessons_total": lessons_total,
-            "lessons_completed": lessons_completed,
+            "enrollment_id":    enrollment.id,
+            "course":           enrollment.course,
+            "enrolled_at":      enrollment.enrolled_at,
+            "lessons_total":    lessons_total,
+            "lessons_completed":lessons_completed,
             "progress_percentage": percentage,
         })
 
@@ -243,10 +369,12 @@ def my_courses(request):
 
 @enrollments_router.post("/{enrollment_id}/progress", response=ProgressOut, auth=jwt_auth)
 def mark_progress(request, enrollment_id: int, data: ProgressIn):
-    """Tandai sebuah lesson sebagai selesai/belum, dalam konteks enrollment tertentu."""
+    """
+    Tandai lesson selesai/belum.
+    Jika progress mencapai 100% → trigger Celery task generate_certificate (async).
+    """
     enrollment = get_object_or_404(Enrollment, pk=enrollment_id)
 
-    # Ownership validation: hanya pemilik enrollment yang boleh update progress-nya
     if enrollment.student_id != request.auth.id:
         raise HttpError(403, "Ini bukan enrollment milik Anda")
 
@@ -255,18 +383,110 @@ def mark_progress(request, enrollment_id: int, data: ProgressIn):
         raise HttpError(400, "Lesson ini bukan bagian dari course yang Anda ikuti")
 
     progress, _created = Progress.objects.update_or_create(
-        student=request.auth, lesson=lesson,
+        student=request.auth,
+        lesson=lesson,
         defaults={"completed": data.completed},
     )
+
+    # Cek apakah semua lesson sudah selesai → trigger certificate
+    if data.completed:
+        total_lessons = Lesson.objects.filter(course=enrollment.course).count()
+        completed_count = Progress.objects.filter(
+            student=request.auth,
+            lesson__course=enrollment.course,
+            completed=True,
+        ).count()
+        if total_lessons > 0 and completed_count >= total_lessons:
+            try:
+                from lms.tasks import generate_certificate
+                generate_certificate.delay(request.auth.id, enrollment.course_id)
+            except Exception as e:
+                print(f"[CELERY WARNING] generate_certificate.delay failed: {e}")
+
+    # Log MongoDB
+    try:
+        from lms.mongo import log_activity
+        log_activity(
+            user_id=request.auth.id,
+            username=request.auth.username,
+            action="mark_progress",
+            detail={
+                "lesson_id": lesson.id,
+                "lesson_title": lesson.title,
+                "completed": data.completed,
+            },
+            ip=request.META.get("REMOTE_ADDR", ""),
+        )
+    except Exception:
+        pass
+
     return progress
 
+
+# ============================================================
+# REPORTS ROUTER  ->  /api/reports/...
+# ============================================================
+reports_router = Router(tags=["Reports"])
+
+
+@reports_router.get("/courses/{course_id}/export", auth=jwt_auth)
+@is_admin
+def export_report(request, course_id: int):
+    """
+    Trigger async CSV export untuk satu course.
+    Task berjalan di Celery worker; response langsung mengembalikan task ID.
+    """
+    course = get_object_or_404(Course, pk=course_id)
+    from lms.tasks import export_course_report
+    task = export_course_report.delay(course_id, request.auth.id)
+    return {
+        "message": "Export sedang diproses di background",
+        "task_id": task.id,
+        "course":  course.title,
+    }
+
+
+@reports_router.get("/analytics/top-courses", auth=jwt_auth)
+@is_admin
+def top_courses_report(request, limit: int = 5):
+    """Top N course berdasarkan jumlah student (dari MongoDB analytics)."""
+    from lms.mongo import aggregate_top_courses
+    return aggregate_top_courses(limit=limit)
+
+
+@reports_router.get("/analytics/activity-summary", auth=jwt_auth)
+@is_admin
+def activity_summary_report(request, days: int = 7):
+    """Ringkasan aktivitas dalam N hari terakhir (dari MongoDB activity logs)."""
+    from lms.mongo import aggregate_activity_summary
+    return aggregate_activity_summary(days=days)
+
+
+@reports_router.get("/courses/{course_id}/analytics", auth=jwt_auth)
+@is_admin
+def course_analytics(request, course_id: int):
+    """Detail analytics satu course dari MongoDB."""
+    from lms.mongo import get_course_analytics
+    data = get_course_analytics(course_id)
+    if not data:
+        raise HttpError(404, "Analytics untuk course ini belum tersedia. Jalankan update_course_statistics task.")
+    return data
+
+
+# ============================================================
+# MAIN NinjaAPI INSTANCE
+# ============================================================
 api = NinjaAPI(
     title="Simple LMS API",
-    version="1.0.0",
-    description="REST API untuk Simple Learning Management System (Django Ninja + JWT).",
+    version="2.0.0",
+    description=(
+        "REST API untuk Simple LMS — Django Ninja + JWT + Redis Cache "
+        "+ MongoDB Analytics + Celery Tasks."
+    ),
     docs_url="/docs",
 )
 
-api.add_router("/auth", auth_router)
-api.add_router("/courses", courses_router)
+api.add_router("/auth",        auth_router)
+api.add_router("/courses",     courses_router)
 api.add_router("/enrollments", enrollments_router)
+api.add_router("/reports",     reports_router)

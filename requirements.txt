@@ -3,3 +3,19 @@ psycopg2-binary
 python-dotenv
 django-ninja>=1.1
 PyJWT>=2.7
+
+# Redis
+redis>=4.6
+django-redis>=5.4
+
+# Celery + broker
+celery>=5.3
+kombu>=5.3
+flower>=2.0
+
+# MongoDB
+pymongo>=4.6
+
+# Task extras
+Pillow>=10.0       # untuk generate certificate image
+
