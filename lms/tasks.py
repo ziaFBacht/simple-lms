@@ -52,7 +52,6 @@ def send_enrollment_email(self, student_id: int, course_id: int):
             f"  Instruktur: {course.instructor.get_full_name() or course.instructor.username}\n"
             f"  Deskripsi : {course.description[:200]}...\n\n"
             f"Selamat belajar!\n\n"
-            f"— Tim Simple LMS"
         )
 
         send_mail(
