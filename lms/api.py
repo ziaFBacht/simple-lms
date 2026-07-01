@@ -19,8 +19,10 @@ from lms.cache import (
     set_cached_course_detail,
     set_cached_course_list,
 )
+from django.db.models import Avg, Count
+
 from lms.helpers import get_object_or_404
-from lms.models import Category, Course, Enrollment, Lesson, Progress, User
+from lms.models import Category, Course, Enrollment, Lesson, Progress, Review, Section, User, Wishlist
 from lms.permissions import check_course_owner, is_admin, is_instructor, is_student
 from lms.schemas import (
     CourseDetailOut,
@@ -40,9 +42,15 @@ from lms.schemas import (
     RefreshIn,
     RefreshOut,
     RegisterIn,
+    ReviewIn,
+    ReviewOut,
+    SectionIn,
+    SectionOut,
+    StudentDashboardOut,
     TokenOut,
     UserOut,
     UserUpdateIn,
+    WishlistOut,
 )
 
 
@@ -153,11 +161,15 @@ def list_courses(
     search: str = None,
     category_id: int = None,
     instructor_id: int = None,
+    level: str = None,
+    status: str = None,
+    sort: str = "newest",
     page: int = 1,
     page_size: int = 10,
 ):
     """
-    List semua course (PUBLIC) dengan pagination, filter, dan Redis caching.
+    List semua course (PUBLIC) dengan pagination, filter (search, category,
+    instructor, level, status), sorting (newest/popular/rating), dan Redis caching.
 
     Flow:
     1. Cek Redis cache → kalau HIT, kembalikan dari cache (tidak query DB)
@@ -169,7 +181,9 @@ def list_courses(
     page_size = max(min(page_size, 100), 1)
 
     # --- Cache lookup ---
-    cached = get_cached_course_list(page, page_size, search, category_id, instructor_id)
+    cached = get_cached_course_list(
+        page, page_size, search, category_id, instructor_id, level, status, sort
+    )
     if cached:
         return cached
 
@@ -181,14 +195,38 @@ def list_courses(
         qs = qs.filter(category_id=category_id)
     if instructor_id:
         qs = qs.filter(instructor_id=instructor_id)
+    if level:
+        qs = qs.filter(level=level)
+    if status:
+        qs = qs.filter(status=status)
+
+    # Annotate rating & popularity supaya bisa dipakai untuk sorting dan ditampilkan di response
+    qs = qs.annotate(
+        avg_rating=Avg("reviews__rating"),
+        review_count=Count("reviews", distinct=True),
+        enrollment_count=Count("enrollment", distinct=True),
+    )
+
+    sort_map = {
+        "newest": "-id",
+        "popular": "-enrollment_count",
+        "rating": "-avg_rating",
+    }
+    qs = qs.order_by(sort_map.get(sort, "-id"))
 
     total = qs.count()
     pages = max(math.ceil(total / page_size), 1)
     start = (page - 1) * page_size
-    items = list(qs.order_by("id")[start: start + page_size])
+    items = list(qs[start: start + page_size])
 
     # Serialize dulu ke dict pakai schema (supaya bisa disimpan ke Redis)
-    items_data = [CourseOut.from_orm(c).dict() for c in items]
+    items_data = []
+    for c in items:
+        data = CourseOut.from_orm(c).dict()
+        data["avg_rating"] = round(c.avg_rating, 2) if c.avg_rating is not None else None
+        data["review_count"] = c.review_count
+        items_data.append(data)
+
     result = {
         "items": items_data,
         "total": total,
@@ -197,7 +235,9 @@ def list_courses(
         "pages": pages,
     }
 
-    set_cached_course_list(result, page, page_size, search, category_id, instructor_id)
+    set_cached_course_list(
+        result, page, page_size, search, category_id, instructor_id, level, status, sort
+    )
     return result
 
 
@@ -547,6 +587,191 @@ def delete_lesson(request, lesson_id: int):
 
 
 # ============================================================
+# CURRICULUM (SECTIONS) -> /api/courses/{id}/sections, /api/courses/{id}/curriculum
+# ============================================================
+@courses_router.post("/{course_id}/sections", response={201: SectionOut}, auth=jwt_auth)
+@is_instructor
+def create_section(request, course_id: int, data: SectionIn):
+    """Buat section baru dalam course (owner only). Dipakai untuk menyusun curriculum."""
+    course = get_object_or_404(Course, pk=course_id)
+    check_course_owner(course, request.auth)
+
+    section = Section.objects.create(course=course, title=data.title, order=data.order)
+    invalidate_course_cache(course.id)
+    return 201, section
+
+
+@courses_router.get("/{course_id}/curriculum", response=List[SectionOut])
+def get_curriculum(request, course_id: int):
+    """
+    Curriculum lengkap course (PUBLIC): daftar section beserta lesson di dalamnya,
+    terurut sesuai field `order`.
+    """
+    course = get_object_or_404(Course, pk=course_id)
+    return list(course.sections.prefetch_related("lessons").all())
+
+
+# ============================================================
+# REVIEWS -> /api/courses/{id}/reviews
+# ============================================================
+@courses_router.post("/{course_id}/reviews", response={201: ReviewOut}, auth=jwt_auth)
+@is_student
+def create_or_update_review(request, course_id: int, data: ReviewIn):
+    """
+    Buat atau update review untuk course (student yang sudah enroll saja).
+    Satu student hanya bisa punya satu review per course — submit kedua akan
+    meng-update review yang sudah ada (bukan membuat baris baru).
+    """
+    course = get_object_or_404(Course, pk=course_id)
+
+    if not Enrollment.objects.filter(student=request.auth, course=course).exists():
+        raise HttpError(403, "Anda harus enroll di course ini sebelum memberi review")
+
+    if not (1 <= data.rating <= 5):
+        raise HttpError(400, "Rating harus antara 1 sampai 5")
+
+    review, _created = Review.objects.update_or_create(
+        student=request.auth,
+        course=course,
+        defaults={"rating": data.rating, "comment": data.comment},
+    )
+
+    # Rating berubah -> avg_rating pada cache course list/detail jadi basi
+    invalidate_course_cache(course.id)
+
+    return 201, review
+
+
+@courses_router.get("/{course_id}/reviews", response=List[ReviewOut])
+def list_reviews(request, course_id: int):
+    """Daftar review untuk sebuah course (PUBLIC)."""
+    course = get_object_or_404(Course, pk=course_id)
+    return list(course.reviews.select_related("student").order_by("-created_at"))
+
+
+# ============================================================
+# WISHLIST ROUTER  ->  /api/wishlist/...
+# ============================================================
+wishlist_router = Router(tags=["Wishlist"])
+
+
+@wishlist_router.post("/{course_id}", response={201: WishlistOut}, auth=jwt_auth)
+@is_student
+def add_wishlist(request, course_id: int):
+    """Tambahkan course ke wishlist student yang sedang login."""
+    course = get_object_or_404(Course, pk=course_id)
+    wishlist, created = Wishlist.objects.get_or_create(student=request.auth, course=course)
+    if not created:
+        raise HttpError(400, "Course ini sudah ada di wishlist Anda")
+    return 201, wishlist
+
+
+@wishlist_router.delete("/{course_id}", response={204: None}, auth=jwt_auth)
+@is_student
+def remove_wishlist(request, course_id: int):
+    """Hapus course dari wishlist student yang sedang login."""
+    deleted, _ = Wishlist.objects.filter(student=request.auth, course_id=course_id).delete()
+    if not deleted:
+        raise HttpError(404, "Course ini tidak ada di wishlist Anda")
+    return 204, None
+
+
+@wishlist_router.get("", response=List[WishlistOut], auth=jwt_auth)
+@is_student
+def my_wishlist(request):
+    """Daftar course yang di-wishlist oleh student yang sedang login."""
+    return list(
+        Wishlist.objects.filter(student=request.auth)
+        .select_related("course")
+        .order_by("-created_at")
+    )
+
+
+# ============================================================
+# STUDENTS ROUTER  ->  /api/students/...
+# ============================================================
+students_router = Router(tags=["Students"])
+
+
+@students_router.get("/me/dashboard", response=StudentDashboardOut, auth=jwt_auth)
+@is_student
+def student_dashboard(request):
+    """
+    Dashboard ringkas untuk student yang sedang login:
+    - Course aktif (progress belum 100%) beserta persentase progress.
+    - Course yang sudah selesai (progress 100%).
+    - Jumlah course di wishlist.
+    - Total course yang pernah di-enroll.
+    - Rekomendasi course: diambil dari category yang sama dengan course yang
+      sudah di-enroll, belum pernah di-enroll, status published, diurutkan
+      berdasarkan rating tertinggi.
+    """
+    enrollments = (
+        Enrollment.objects.filter(student=request.auth)
+        .for_student_dashboard()
+        .order_by("-enrolled_at")
+    )
+
+    active_courses = []
+    completed_courses = []
+    enrolled_category_ids = set()
+    enrolled_course_ids = []
+
+    for enrollment in enrollments:
+        enrolled_course_ids.append(enrollment.course_id)
+        if enrollment.course.category_id:
+            enrolled_category_ids.add(enrollment.course.category_id)
+
+        lessons_total = enrollment.course.lessons.count()
+        lessons_completed = Progress.objects.filter(
+            student=request.auth, lesson__course=enrollment.course, completed=True
+        ).count()
+        percentage = (
+            round((lessons_completed / lessons_total) * 100, 2) if lessons_total else 0.0
+        )
+
+        item = {
+            "enrollment_id": enrollment.id,
+            "course": enrollment.course,
+            "enrolled_at": enrollment.enrolled_at,
+            "lessons_total": lessons_total,
+            "lessons_completed": lessons_completed,
+            "progress_percentage": percentage,
+        }
+
+        # Course dianggap "selesai" hanya kalau punya lesson DAN semuanya sudah completed.
+        # Course tanpa lesson sama sekali tetap dianggap "aktif" (belum ada progress untuk dinilai).
+        if lessons_total > 0 and lessons_completed >= lessons_total:
+            completed_courses.append(item)
+        else:
+            active_courses.append(item)
+
+    wishlist_count = Wishlist.objects.filter(student=request.auth).count()
+
+    recommended_qs = (
+        Course.objects.for_listing()
+        .filter(category_id__in=enrolled_category_ids, status="published")
+        .exclude(id__in=enrolled_course_ids)
+        .annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True))
+        .order_by("-avg_rating", "-id")[:5]
+    )
+    recommended_courses = []
+    for c in recommended_qs:
+        data = CourseOut.from_orm(c).dict()
+        data["avg_rating"] = round(c.avg_rating, 2) if c.avg_rating is not None else None
+        data["review_count"] = c.review_count
+        recommended_courses.append(data)
+
+    return {
+        "active_courses": active_courses,
+        "completed_courses": completed_courses,
+        "wishlist_count": wishlist_count,
+        "total_courses_enrolled": len(enrolled_course_ids),
+        "recommended_courses": recommended_courses,
+    }
+
+
+# ============================================================
 # MAIN NinjaAPI INSTANCE
 # ============================================================
 api = NinjaAPI(
@@ -564,3 +789,5 @@ api.add_router("/courses",     courses_router)
 api.add_router("/lessons",     lessons_router)
 api.add_router("/enrollments", enrollments_router)
 api.add_router("/reports",     reports_router)
+api.add_router("/wishlist",    wishlist_router)
+api.add_router("/students",    students_router)

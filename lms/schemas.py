@@ -110,6 +110,10 @@ class CourseOut(Schema):
     description: str
     instructor: UserOut
     category: Optional[CategoryOut] = None
+    level: str = "beginner"
+    status: str = "published"
+    avg_rating: Optional[float] = None
+    review_count: int = 0
 
 
 class CourseDetailOut(CourseOut):
@@ -162,3 +166,62 @@ class MyCourseOut(Schema):
     lessons_total: int
     lessons_completed: int
     progress_percentage: float
+
+
+# ============================================================
+# SECTION / CURRICULUM SCHEMAS
+# ============================================================
+class SectionIn(Schema):
+    """Input untuk membuat section baru dalam course."""
+    title: str
+    order: int
+
+
+class SectionOut(Schema):
+    """Output Section beserta daftar lesson di dalamnya (nested curriculum)."""
+    id: int
+    title: str
+    order: int
+    lessons: List[LessonOut] = []
+
+    @staticmethod
+    def resolve_lessons(obj):
+        return obj.lessons.all()
+
+
+# ============================================================
+# REVIEW SCHEMAS
+# ============================================================
+class ReviewIn(Schema):
+    """Input untuk membuat/update review course. Rating divalidasi 1-5 di endpoint."""
+    rating: int
+    comment: Optional[str] = None
+
+
+class ReviewOut(Schema):
+    id: int
+    student: UserOut
+    rating: int
+    comment: Optional[str] = None
+    created_at: datetime
+
+
+# ============================================================
+# WISHLIST SCHEMAS
+# ============================================================
+class WishlistOut(Schema):
+    id: int
+    course: CourseOut
+    created_at: datetime
+
+
+# ============================================================
+# STUDENT DASHBOARD SCHEMA
+# ============================================================
+class StudentDashboardOut(Schema):
+    """Output untuk GET /api/students/me/dashboard."""
+    active_courses: List[MyCourseOut] = []
+    completed_courses: List[MyCourseOut] = []
+    wishlist_count: int = 0
+    total_courses_enrolled: int = 0
+    recommended_courses: List[CourseOut] = []

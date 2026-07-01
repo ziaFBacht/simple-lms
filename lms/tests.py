@@ -4,7 +4,7 @@ from django.db import IntegrityError
 from ninja.testing import TestClient
 
 from lms.api import api
-from lms.models import Course, Lesson, Enrollment, Progress, Category
+from lms.models import Course, Lesson, Enrollment, Progress, Category, Section, Review, Wishlist
 from lms.auth import create_access_token
 
 User = get_user_model()
@@ -285,3 +285,371 @@ class SimpleLMSTestSuite(TestCase):
         response = self.client.get("/enrollments/my-courses", headers=self.student_headers)
         self.assertEqual(response.json()[0]["lessons_completed"], 1)
         self.assertEqual(response.json()[0]["progress_percentage"], 50.0)
+
+    # ==========================================
+    # SEARCH, FILTER, SORT TESTS (Paket 1)
+    # ==========================================
+    def test_list_courses_filter_by_level_and_status(self):
+        """Test filtering course list by level and status query params."""
+        Course.objects.create(
+            title="Django Beginner", description="Basic Django",
+            instructor=self.instructor, category=self.category,
+            level="beginner", status="published",
+        )
+        Course.objects.create(
+            title="Django Advanced", description="Advanced Django",
+            instructor=self.instructor, category=self.category,
+            level="advanced", status="published",
+        )
+        Course.objects.create(
+            title="Django Draft Course", description="Not ready yet",
+            instructor=self.instructor, category=self.category,
+            level="advanced", status="draft",
+        )
+
+        # Filter by level=advanced -> should return 2 (published + draft)
+        response = self.client.get("/courses?level=advanced")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 2)
+
+        # Filter by level=advanced AND status=published -> should return 1
+        response = self.client.get("/courses?level=advanced&status=published")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 1)
+        self.assertEqual(response.json()["items"][0]["title"], "Django Advanced")
+
+        # Filter by status=draft -> should return 1
+        response = self.client.get("/courses?status=draft")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 1)
+
+    def test_list_courses_search_by_keyword(self):
+        """Test searching course list by title keyword."""
+        Course.objects.create(
+            title="Python for Beginners", description="Learn Python",
+            instructor=self.instructor, category=self.category,
+        )
+        Course.objects.create(
+            title="JavaScript Essentials", description="Learn JS",
+            instructor=self.instructor, category=self.category,
+        )
+
+        response = self.client.get("/courses?search=Python")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 1)
+        self.assertEqual(response.json()["items"][0]["title"], "Python for Beginners")
+
+    def test_list_courses_sort_by_rating(self):
+        """Test sort=rating orders courses by average review rating descending."""
+        course_low = Course.objects.create(
+            title="Low Rated Course", description="desc",
+            instructor=self.instructor, category=self.category,
+        )
+        course_high = Course.objects.create(
+            title="High Rated Course", description="desc",
+            instructor=self.instructor, category=self.category,
+        )
+
+        # Student enrolls and reviews both courses
+        Enrollment.objects.create(student=self.student, course=course_low)
+        Enrollment.objects.create(student=self.student, course=course_high)
+        Review.objects.create(student=self.student, course=course_low, rating=2)
+        Review.objects.create(student=self.student, course=course_high, rating=5)
+
+        response = self.client.get("/courses?sort=rating")
+        self.assertEqual(response.status_code, 200)
+        items = response.json()["items"]
+        self.assertEqual(items[0]["title"], "High Rated Course")
+
+    # ==========================================
+    # CURRICULUM / SECTION TESTS (Paket 1)
+    # ==========================================
+    def test_create_section_as_owner_instructor(self):
+        """Test instructor owner can create a section under their own course."""
+        course = Course.objects.create(
+            title="Curriculum Course", description="desc",
+            instructor=self.instructor,
+        )
+        data = {"title": "Section 1: Introduction", "order": 1}
+        response = self.client.post(
+            f"/courses/{course.id}/sections", json=data, headers=self.instructor_headers
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["title"], "Section 1: Introduction")
+
+    def test_create_section_forbidden_for_non_owner_instructor(self):
+        """Test non-owner instructor cannot create a section (returns 403)."""
+        course = Course.objects.create(
+            title="Curriculum Course 2", description="desc",
+            instructor=self.instructor,
+        )
+        data = {"title": "Section X", "order": 1}
+        response = self.client.post(
+            f"/courses/{course.id}/sections", json=data, headers=self.other_instructor_headers
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_create_section_forbidden_for_student(self):
+        """Test student role cannot create a section (returns 403)."""
+        course = Course.objects.create(
+            title="Curriculum Course 3", description="desc",
+            instructor=self.instructor,
+        )
+        data = {"title": "Section X", "order": 1}
+        response = self.client.post(
+            f"/courses/{course.id}/sections", json=data, headers=self.student_headers
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_get_curriculum_public_with_nested_lessons(self):
+        """Test curriculum endpoint is public and returns sections with nested lessons."""
+        course = Course.objects.create(
+            title="Curriculum Course 4", description="desc",
+            instructor=self.instructor,
+        )
+        section = Section.objects.create(course=course, title="Section 1", order=1)
+        Lesson.objects.create(
+            course=course, section=section, title="Lesson A", content="content", order=1
+        )
+        Lesson.objects.create(
+            course=course, section=section, title="Lesson B", content="content", order=2
+        )
+
+        response = self.client.get(f"/courses/{course.id}/curriculum")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["title"], "Section 1")
+        self.assertEqual(len(data[0]["lessons"]), 2)
+
+    # ==========================================
+    # REVIEW TESTS (Paket 1)
+    # ==========================================
+    def test_create_review_requires_enrollment(self):
+        """Test student who has not enrolled cannot leave a review (returns 403)."""
+        course = Course.objects.create(
+            title="Review Course", description="desc", instructor=self.instructor
+        )
+        data = {"rating": 5, "comment": "Great course!"}
+        response = self.client.post(
+            f"/courses/{course.id}/reviews", json=data, headers=self.student_headers
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_create_review_success_after_enrollment(self):
+        """Test enrolled student can successfully leave a review."""
+        course = Course.objects.create(
+            title="Review Course 2", description="desc", instructor=self.instructor
+        )
+        Enrollment.objects.create(student=self.student, course=course)
+
+        data = {"rating": 4, "comment": "Pretty good"}
+        response = self.client.post(
+            f"/courses/{course.id}/reviews", json=data, headers=self.student_headers
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["rating"], 4)
+        self.assertEqual(response.json()["student"]["username"], "student_test")
+
+    def test_create_review_invalid_rating_rejected(self):
+        """Test rating outside 1-5 range returns 400."""
+        course = Course.objects.create(
+            title="Review Course 3", description="desc", instructor=self.instructor
+        )
+        Enrollment.objects.create(student=self.student, course=course)
+
+        data = {"rating": 9, "comment": "Too high"}
+        response = self.client.post(
+            f"/courses/{course.id}/reviews", json=data, headers=self.student_headers
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_review_duplicate_updates_instead_of_creating_new(self):
+        """Test submitting a second review from the same student updates the existing one."""
+        course = Course.objects.create(
+            title="Review Course 4", description="desc", instructor=self.instructor
+        )
+        Enrollment.objects.create(student=self.student, course=course)
+
+        self.client.post(
+            f"/courses/{course.id}/reviews",
+            json={"rating": 3, "comment": "Okay"},
+            headers=self.student_headers,
+        )
+        response = self.client.post(
+            f"/courses/{course.id}/reviews",
+            json={"rating": 5, "comment": "Changed my mind, love it"},
+            headers=self.student_headers,
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Review.objects.filter(student=self.student, course=course).count(), 1)
+        self.assertEqual(
+            Review.objects.get(student=self.student, course=course).rating, 5
+        )
+
+    def test_list_reviews_public(self):
+        """Test listing reviews for a course is public (no auth required)."""
+        course = Course.objects.create(
+            title="Review Course 5", description="desc", instructor=self.instructor
+        )
+        Enrollment.objects.create(student=self.student, course=course)
+        Review.objects.create(student=self.student, course=course, rating=5, comment="Nice")
+
+        response = self.client.get(f"/courses/{course.id}/reviews")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+        self.assertEqual(response.json()[0]["rating"], 5)
+
+    # ==========================================
+    # WISHLIST TESTS (Paket 1)
+    # ==========================================
+    def test_add_course_to_wishlist(self):
+        """Test student can add a course to their wishlist."""
+        course = Course.objects.create(
+            title="Wishlist Course", description="desc", instructor=self.instructor
+        )
+        response = self.client.post(f"/wishlist/{course.id}", headers=self.student_headers)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["course"]["title"], "Wishlist Course")
+
+    def test_add_duplicate_wishlist_rejected(self):
+        """Test adding the same course twice to wishlist returns 400."""
+        course = Course.objects.create(
+            title="Wishlist Course 2", description="desc", instructor=self.instructor
+        )
+        self.client.post(f"/wishlist/{course.id}", headers=self.student_headers)
+        response = self.client.post(f"/wishlist/{course.id}", headers=self.student_headers)
+        self.assertEqual(response.status_code, 400)
+
+    def test_remove_course_from_wishlist(self):
+        """Test student can remove a course from their wishlist."""
+        course = Course.objects.create(
+            title="Wishlist Course 3", description="desc", instructor=self.instructor
+        )
+        Wishlist.objects.create(student=self.student, course=course)
+
+        response = self.client.delete(f"/wishlist/{course.id}", headers=self.student_headers)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(
+            Wishlist.objects.filter(student=self.student, course=course).exists()
+        )
+
+    def test_remove_nonexistent_wishlist_returns_404(self):
+        """Test removing a course that isn't in the wishlist returns 404."""
+        course = Course.objects.create(
+            title="Wishlist Course 4", description="desc", instructor=self.instructor
+        )
+        response = self.client.delete(f"/wishlist/{course.id}", headers=self.student_headers)
+        self.assertEqual(response.status_code, 404)
+
+    def test_list_my_wishlist(self):
+        """Test student can list all courses in their own wishlist."""
+        course1 = Course.objects.create(
+            title="Wishlist Course 5", description="desc", instructor=self.instructor
+        )
+        course2 = Course.objects.create(
+            title="Wishlist Course 6", description="desc", instructor=self.instructor
+        )
+        Wishlist.objects.create(student=self.student, course=course1)
+        Wishlist.objects.create(student=self.student, course=course2)
+
+        response = self.client.get("/wishlist", headers=self.student_headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 2)
+
+    def test_wishlist_forbidden_for_instructor(self):
+        """Test instructor role cannot use wishlist endpoints (student-only feature)."""
+        course = Course.objects.create(
+            title="Wishlist Course 7", description="desc", instructor=self.instructor
+        )
+        response = self.client.post(f"/wishlist/{course.id}", headers=self.instructor_headers)
+        self.assertEqual(response.status_code, 403)
+
+    # ==========================================
+    # STUDENT DASHBOARD TESTS (Paket 1)
+    # ==========================================
+    def test_student_dashboard_requires_auth(self):
+        """Test dashboard endpoint requires authentication (returns 401)."""
+        response = self.client.get("/students/me/dashboard")
+        self.assertEqual(response.status_code, 401)
+
+    def test_student_dashboard_forbidden_for_instructor(self):
+        """Test dashboard endpoint is student-only (instructor gets 403)."""
+        response = self.client.get("/students/me/dashboard", headers=self.instructor_headers)
+        self.assertEqual(response.status_code, 403)
+
+    def test_student_dashboard_splits_active_and_completed_courses(self):
+        """Test dashboard correctly separates active vs. completed courses based on progress."""
+        # Course A: fully completed
+        course_a = Course.objects.create(
+            title="Dashboard Course A", description="desc", instructor=self.instructor
+        )
+        lesson_a1 = Lesson.objects.create(course=course_a, title="A1", content="c", order=1)
+        Enrollment.objects.create(student=self.student, course=course_a)
+        Progress.objects.create(student=self.student, lesson=lesson_a1, completed=True)
+
+        # Course B: still in progress
+        course_b = Course.objects.create(
+            title="Dashboard Course B", description="desc", instructor=self.instructor
+        )
+        Lesson.objects.create(course=course_b, title="B1", content="c", order=1)
+        Lesson.objects.create(course=course_b, title="B2", content="c", order=2)
+        Enrollment.objects.create(student=self.student, course=course_b)
+
+        response = self.client.get("/students/me/dashboard", headers=self.student_headers)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        self.assertEqual(len(data["completed_courses"]), 1)
+        self.assertEqual(data["completed_courses"][0]["course"]["title"], "Dashboard Course A")
+        self.assertEqual(data["completed_courses"][0]["progress_percentage"], 100.0)
+
+        self.assertEqual(len(data["active_courses"]), 1)
+        self.assertEqual(data["active_courses"][0]["course"]["title"], "Dashboard Course B")
+        self.assertEqual(data["active_courses"][0]["progress_percentage"], 0.0)
+
+        self.assertEqual(data["total_courses_enrolled"], 2)
+
+    def test_student_dashboard_wishlist_count(self):
+        """Test dashboard reports the correct wishlist count."""
+        course1 = Course.objects.create(
+            title="Dashboard Wishlist 1", description="desc", instructor=self.instructor
+        )
+        course2 = Course.objects.create(
+            title="Dashboard Wishlist 2", description="desc", instructor=self.instructor
+        )
+        Wishlist.objects.create(student=self.student, course=course1)
+        Wishlist.objects.create(student=self.student, course=course2)
+
+        response = self.client.get("/students/me/dashboard", headers=self.student_headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["wishlist_count"], 2)
+
+    def test_student_dashboard_recommendations_exclude_enrolled_courses(self):
+        """Test recommended_courses only suggests same-category courses the student hasn't taken."""
+        # Student enrolls in a course under self.category
+        enrolled_course = Course.objects.create(
+            title="Enrolled Course", description="desc",
+            instructor=self.instructor, category=self.category, status="published",
+        )
+        Enrollment.objects.create(student=self.student, course=enrolled_course)
+
+        # Another published course, same category, not enrolled -> should be recommended
+        other_course = Course.objects.create(
+            title="Other Course Same Category", description="desc",
+            instructor=self.instructor, category=self.category, status="published",
+        )
+
+        # A draft course in the same category -> should NOT be recommended
+        Course.objects.create(
+            title="Draft Course Same Category", description="desc",
+            instructor=self.instructor, category=self.category, status="draft",
+        )
+
+        response = self.client.get("/students/me/dashboard", headers=self.student_headers)
+        self.assertEqual(response.status_code, 200)
+        recommended_titles = [c["title"] for c in response.json()["recommended_courses"]]
+
+        self.assertIn("Other Course Same Category", recommended_titles)
+        self.assertNotIn("Enrolled Course", recommended_titles)
+        self.assertNotIn("Draft Course Same Category", recommended_titles)

@@ -23,7 +23,8 @@ from ninja.errors import HttpError
 # ============================================================
 # CACHE KEY BUILDER
 # ============================================================
-def _key_course_list(page: int, page_size: int, search: str, category_id, instructor_id) -> str:
+def _key_course_list(page: int, page_size: int, search: str, category_id, instructor_id,
+                      level: str = None, status: str = None, sort: str = None) -> str:
     """
     Key unik untuk list courses. Semua parameter pagination & filter
     dimasukkan ke key supaya setiap kombinasi berbeda tidak saling menimpa.
@@ -33,7 +34,10 @@ def _key_course_list(page: int, page_size: int, search: str, category_id, instru
         f"p{page}:ps{page_size}:"
         f"s{search or ''}:"
         f"cat{category_id or ''}:"
-        f"inst{instructor_id or ''}"
+        f"inst{instructor_id or ''}:"
+        f"lvl{level or ''}:"
+        f"st{status or ''}:"
+        f"sort{sort or ''}"
     )
 
 
@@ -48,12 +52,13 @@ def _key_rate_limit(ip: str) -> str:
 # ============================================================
 # COURSE LIST CACHE
 # ============================================================
-def get_cached_course_list(page, page_size, search, category_id, instructor_id):
+def get_cached_course_list(page, page_size, search, category_id, instructor_id,
+                            level=None, status=None, sort=None):
     """
     Ambil course list dari Redis cache.
     Return dict (cached) atau None (cache miss).
     """
-    key = _key_course_list(page, page_size, search, category_id, instructor_id)
+    key = _key_course_list(page, page_size, search, category_id, instructor_id, level, status, sort)
     cached = cache.get(key)
     if cached:
         print(f"[CACHE HIT] {key}")
@@ -62,9 +67,10 @@ def get_cached_course_list(page, page_size, search, category_id, instructor_id):
     return cached
 
 
-def set_cached_course_list(data: dict, page, page_size, search, category_id, instructor_id):
+def set_cached_course_list(data: dict, page, page_size, search, category_id, instructor_id,
+                            level=None, status=None, sort=None):
     """Simpan course list ke Redis dengan TTL dari settings."""
-    key = _key_course_list(page, page_size, search, category_id, instructor_id)
+    key = _key_course_list(page, page_size, search, category_id, instructor_id, level, status, sort)
     ttl = getattr(settings, 'CACHE_TTL_COURSE_LIST', 300)
     cache.set(key, data, timeout=ttl)
     print(f"[CACHE SET] {key} (TTL={ttl}s)")
