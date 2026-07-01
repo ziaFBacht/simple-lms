@@ -75,6 +75,20 @@ class LessonOut(Schema):
     order: int
 
 
+class LessonIn(Schema):
+    """Input untuk membuat lesson baru."""
+    title: str
+    content: str
+    order: int
+
+
+class LessonUpdateIn(Schema):
+    """Input untuk memperbarui lesson (semua field opsional)."""
+    title: Optional[str] = None
+    content: Optional[str] = None
+    order: Optional[int] = None
+
+
 class CourseIn(Schema):
     """Input untuk membuat course baru (POST /api/courses)."""
     title: str

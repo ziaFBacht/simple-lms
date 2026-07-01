@@ -29,6 +29,9 @@ from lms.schemas import (
     CourseUpdateIn,
     EnrollmentIn,
     EnrollmentOut,
+    LessonIn,
+    LessonOut,
+    LessonUpdateIn,
     LoginIn,
     MyCourseOut,
     PaginatedCoursesOut,
@@ -308,8 +311,10 @@ def enroll_course(request, data: EnrollmentIn):
     """
     course = get_object_or_404(Course, pk=data.course_id)
 
+    from django.db import transaction
     try:
-        enrollment = Enrollment.objects.create(student=request.auth, course=course)
+        with transaction.atomic():
+            enrollment = Enrollment.objects.create(student=request.auth, course=course)
     except IntegrityError:
         raise HttpError(409, "Anda sudah terdaftar di course ini")
 
@@ -474,6 +479,74 @@ def course_analytics(request, course_id: int):
 
 
 # ============================================================
+# LESSONS ROUTER  ->  /api/lessons/...
+# ============================================================
+lessons_router = Router(tags=["Lessons"])
+
+
+@courses_router.post("/{course_id}/lessons", response={201: LessonOut}, auth=jwt_auth)
+@is_instructor
+def create_lesson(request, course_id: int, data: LessonIn):
+    """Buat lesson baru dalam course (owner only)."""
+    course = get_object_or_404(Course, pk=course_id)
+    check_course_owner(course, request.auth)
+    lesson = Lesson.objects.create(
+        course=course,
+        title=data.title,
+        content=data.content,
+        order=data.order,
+    )
+    # Invalidate cache detail course
+    invalidate_course_cache(course.id)
+    return 201, lesson
+
+
+@courses_router.get("/{course_id}/lessons", response=List[LessonOut])
+def list_lessons(request, course_id: int):
+    """Daftar lesson dalam course (PUBLIC)."""
+    course = get_object_or_404(Course, pk=course_id)
+    return list(course.lessons.all())
+
+
+@lessons_router.get("/{lesson_id}", response=LessonOut)
+def get_lesson(request, lesson_id: int):
+    """Detail lesson (PUBLIC)."""
+    lesson = get_object_or_404(Lesson, pk=lesson_id)
+    return lesson
+
+
+@lessons_router.patch("/{lesson_id}", response=LessonOut, auth=jwt_auth)
+def update_lesson(request, lesson_id: int, data: LessonUpdateIn):
+    """Update lesson (owner only)."""
+    lesson = get_object_or_404(Lesson, pk=lesson_id)
+    check_course_owner(lesson.course, request.auth)
+
+    if data.title is not None:
+        lesson.title = data.title
+    if data.content is not None:
+        lesson.content = data.content
+    if data.order is not None:
+        lesson.order = data.order
+
+    lesson.save()
+    invalidate_course_cache(lesson.course.id)
+    return lesson
+
+
+@lessons_router.delete("/{lesson_id}", response={204: None}, auth=jwt_auth)
+def delete_lesson(request, lesson_id: int):
+    """Hapus lesson (owner/admin only)."""
+    lesson = get_object_or_404(Lesson, pk=lesson_id)
+    if request.auth.role != "admin":
+        check_course_owner(lesson.course, request.auth)
+
+    course_id = lesson.course.id
+    lesson.delete()
+    invalidate_course_cache(course_id)
+    return 204, None
+
+
+# ============================================================
 # MAIN NinjaAPI INSTANCE
 # ============================================================
 api = NinjaAPI(
@@ -488,5 +561,6 @@ api = NinjaAPI(
 
 api.add_router("/auth",        auth_router)
 api.add_router("/courses",     courses_router)
+api.add_router("/lessons",     lessons_router)
 api.add_router("/enrollments", enrollments_router)
 api.add_router("/reports",     reports_router)
