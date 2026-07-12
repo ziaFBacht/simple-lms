@@ -127,22 +127,7 @@ Untuk mempermudah pengujian hak akses (RBAC), berikut adalah akun demo yang dapa
 
 ---
 
-### 8. Bukti Pengujian (Screenshot / Test Results)
-* Seluruh endpoint API terdokumentasi dengan baik menggunakan OpenAPI/Swagger di `/docs`, dikelompokkan per tag: Authentication, Courses, Lessons, Enrollments, Reports, Wishlist, Students.
-* Testing otomatis (`lms/tests.py`) mencakup **34 unit & integration test** yang seluruhnya **PASS**, meliputi:
-  * Authentication & JWT (register, login, refresh, me).
-  * CRUD Course & Lesson beserta RBAC per role.
-  * Enrollment & progress tracking.
-  * Search/filter/sort course (`level`, `status`, `search`, `sort=rating`).
-  * Curriculum/Section (ownership & permission).
-  * Review (validasi enrollment, rating 1–5, update-bukan-duplikat).
-  * Wishlist (duplikat, remove, list, role restriction).
-  * Student Dashboard (pembagian active/completed, wishlist count, rekomendasi yang tepat).
-* Jalankan dengan: `docker compose run web python manage.py test lms`.
-
----
-
-### 9. Kendala dan Solusi
+### 8. Kendala dan Solusi
 * **Kendala Konektivitas Layanan MongoDB & RabbitMQ:** Terkadang container Django menyala lebih cepat dibandingkan layanan database MongoDB dan message broker RabbitMQ saat pertama kali dijalankan, menyebabkan error koneksi di awal.
   **Solusi:** Menambahkan skrip inisialisasi healthcheck di container `web` (`docker-compose.yml`) menggunakan shell loop yang memeriksa ketersediaan port Redis & PostgreSQL sebelum server Django mulai beroperasi. Selain itu, seluruh pemanggilan MongoDB dan Celery dibungkus `try/except` agar endpoint utama tetap berhasil merespons meskipun layanan pendukung tersebut belum siap.
 * **Kendala Cache Key Bertabrakan Setelah Menambah Filter Baru:** Setelah parameter `level`, `status`, dan `sort` ditambahkan ke `GET /api/courses`, key Redis lama (yang hanya berdasarkan `search`/`category_id`/`instructor_id`) berisiko mengembalikan hasil filter yang salah karena kombinasi baru tidak tercermin di key.
@@ -152,5 +137,5 @@ Untuk mempermudah pengujian hak akses (RBAC), berikut adalah akun demo yang dapa
 
 ---
 
-### 10. Kesimpulan
+### 9. Kesimpulan
 Pengembangan Simple LMS Extended Backend ini memberikan pengalaman mendalam mengenai bagaimana merancang backend yang andal menggunakan arsitektur modular di Django. Penggunaan Redis secara signifikan mengurangi latency data publik, MongoDB memfasilitasi pencatatan aktivitas berskala besar secara fleksibel, dan Celery + RabbitMQ memastikan operasi-operasi berat (seperti email & rendering file) tidak mengganggu waktu tunggu respon dari client utama. Penambahan Paket 1 (LMS Experience) — curriculum berbasis section, review & wishlist, search/filter/sort lanjutan, serta student dashboard — melengkapi sisi pengalaman pengguna (student experience) yang sebelumnya belum tersentuh, sekaligus melatih penerapan Django ORM annotation, cache key design, dan RBAC yang konsisten pada fitur-fitur baru.

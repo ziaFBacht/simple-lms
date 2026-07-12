@@ -62,13 +62,13 @@ auth_router = Router(tags=["Authentication"])
 
 @auth_router.post("/register", response={201: UserOut})
 def register(request, data: RegisterIn):
-    """Registrasi user baru. Role hanya boleh 'student' atau 'instructor'."""
+    """
+    Registrasi user baru. Role hanya boleh 'student' atau 'instructor'.
+    """
     if data.role not in ("student", "instructor"):
         raise HttpError(400, "Role hanya boleh 'student' atau 'instructor'")
     if User.objects.filter(username=data.username).exists():
         raise HttpError(400, "Username sudah digunakan")
-    if User.objects.filter(email=data.email).exists():
-        raise HttpError(400, "Email sudah digunakan")
 
     user = User.objects.create_user(
         username=data.username,

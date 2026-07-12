@@ -3,8 +3,10 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError
 from ninja.testing import TestClient
 
+# Semua email akan lewat email saya
+
 from lms.api import api
-from lms.models import Course, Lesson, Enrollment, Progress, Category, Section, Review, Wishlist
+from lms.models import Course, Lesson, Enrollment, Progress, Category, Section, Review, Wishlist, User
 from lms.auth import create_access_token
 
 User = get_user_model()
@@ -86,6 +88,30 @@ class SimpleLMSTestSuite(TestCase):
         }
         response = self.client.post("/auth/register", json=data)
         self.assertEqual(response.status_code, 400)
+
+    def test_register_user_duplicate_email_is_allowed(self):
+        """Test registering a second, different-username account with an email
+        that's already used by another account succeeds (email is not unique)."""
+        first = {
+            "username": "email_owner_1",
+            "email": "shared@test.com",
+            "password": "strongpassword123",
+            "role": "student",
+        }
+        response = self.client.post("/auth/register", json=first)
+        self.assertEqual(response.status_code, 201)
+
+        second = {
+            "username": "email_owner_2",  # different username, same email
+            "email": "shared@test.com",
+            "password": "strongpassword123",
+            "role": "instructor",
+        }
+        response = self.client.post("/auth/register", json=second)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["username"], "email_owner_2")
+
+        self.assertEqual(User.objects.filter(email="shared@test.com").count(), 2)
 
     def test_login_success(self):
         """Test logging in with valid credentials returns JWT tokens."""
